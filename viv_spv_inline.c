@@ -23,6 +23,8 @@
 #define OP_FUNCTION_END 56
 #define OP_FUNCTION_CALL 57
 #define OP_VARIABLE 59
+#define OP_ACCESS_CHAIN 65
+#define OP_IN_BOUNDS_ACCESS_CHAIN 66
 #define OP_COMPOSITE_CONSTRUCT 80
 #define OP_COMPOSITE_EXTRACT 81
 #define OP_F_ADD 129
@@ -65,6 +67,7 @@ struct plan {
     int simplify_needed;
     int strip_needed;
     int mix_needed;
+    int chain_needed;
 };
 
 static int func_index(struct func *f, int n, uint32_t id) {
@@ -184,12 +187,12 @@ static int analyze(const uint32_t *code, size_t words, struct plan *p) {
     memset(p, 0, sizeof *p);
     if (words < 5) return 0;
     uint32_t bound = code[3];
-    uint8_t *kind = calloc(bound, 1);
+    uint8_t *kind = calloc(bound, 1), *isconst = calloc(bound, 1), *chain = calloc(bound, 1);
     struct func *f = calloc(words / 4 + 1, sizeof *f);
     struct call *c = calloc(words / 4 + 1, sizeof *c);
     uint32_t *entries = calloc(words / 4 + 1, sizeof *entries);
     int nf = 0, nc = 0, ne = 0, cur = -1, ok = 0;
-    if (!kind || !f || !c || !entries) goto out;
+    if (!kind || !isconst || !chain || !f || !c || !entries) goto out;
 
     for (size_t i = 5; i < words;) {
         uint32_t op = code[i] & 0xffff, len = code[i] >> 16;
@@ -214,6 +217,14 @@ static int analyze(const uint32_t *code, size_t words, struct plan *p) {
             if (w[1] < bound && (kind[w[1]] & K_STRUCT_TYPE)) kind[w[2]] |= K_CONSTRUCT;
             for (uint32_t k = 3; k < len; k++)
                 if (w[k] < bound && (kind[w[k]] & (K_PARAM | K_FROM_PARAM)) && cur >= 0) f[cur].needed = 1;
+        } else if (((op >= 41 && op <= 46) || (op >= 48 && op <= 52)) && len > 2 && w[2] < bound) {
+            isconst[w[2]] = 1;
+        } else if ((op == OP_ACCESS_CHAIN || op == OP_IN_BOUNDS_ACCESS_CHAIN) && len > 3 && w[2] < bound && w[3] < bound) {
+            uint8_t dyn = chain[w[3]] & 2;
+            for (uint32_t k = 4; k < len; k++)
+                if (w[k] >= bound || !isconst[w[k]]) dyn = 2;
+            if ((chain[w[3]] & 1) && dyn) p->chain_needed = 1;
+            chain[w[2]] = 1 | dyn;
         } else if (op == OP_FUNCTION_CALL && len > 3 && cur >= 0) {
             c[nc].caller = cur;
             c[nc].callee = w[3];
@@ -245,6 +256,7 @@ static int analyze(const uint32_t *code, size_t words, struct plan *p) {
     if (enabled("VIV_SPV_NO_STRIP") && image_count(code, words, bound) > g_max_sampled_images)
         p->strip_needed = 1;
     if (!enabled("VIV_SPV_NO_SIMPLIFY")) p->simplify_needed = 0;
+    if (!enabled("VIV_SPV_NO_COMBINE")) p->chain_needed = 0;
     if (p->inline_needed && enabled("VIV_SPV_NO_SIMPLIFY")) p->simplify_needed = 1;
 
     if (p->inline_needed) {
@@ -260,6 +272,8 @@ static int analyze(const uint32_t *code, size_t words, struct plan *p) {
     ok = 1;
 out:
     free(kind);
+    free(isconst);
+    free(chain);
     free(f);
     free(c);
     free(entries);
@@ -277,6 +291,7 @@ static spv_binary rewrite(const uint32_t *code, size_t words, const struct plan 
         flags[n++] = "--eliminate-dead-functions";
     }
     if (p->mix_needed && !p->inline_needed) flags[n++] = "--eliminate-dead-code-aggressive";
+    if (p->chain_needed) flags[n++] = "--combine-access-chains";
     if (p->simplify_needed) flags[n++] = "--simplify-instructions";
     if (p->strip_needed) {
         flags[n++] = "--remove-unused-interface-variables";
@@ -306,7 +321,7 @@ layer_CreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo *info,
     struct plan p;
     int ok = analyze(cur, words, &p);
     p.mix_needed = nmix > 0;
-    if (!ok || !(p.inline_needed || p.simplify_needed || p.strip_needed || p.mix_needed)) {
+    if (!ok || !(p.inline_needed || p.simplify_needed || p.strip_needed || p.mix_needed || p.chain_needed)) {
         free(p.code);
         free(pre);
         return next(device, info, alloc, module);
@@ -320,8 +335,8 @@ layer_CreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo *info,
         return next(device, info, alloc, module);
     }
     if (debug())
-        fprintf(stderr, "viv_spv_inline: rewrote module %zu -> %zu words (inline=%d simplify=%d strip=%d mix=%d)\n",
-                orig_words, rewritten->wordCount, p.inline_needed, p.simplify_needed, p.strip_needed, nmix);
+        fprintf(stderr, "viv_spv_inline: rewrote module %zu -> %zu words (inline=%d simplify=%d strip=%d mix=%d chain=%d)\n",
+                orig_words, rewritten->wordCount, p.inline_needed, p.simplify_needed, p.strip_needed, nmix, p.chain_needed);
     VkShaderModuleCreateInfo patched = *info;
     patched.codeSize = rewritten->wordCount * 4;
     patched.pCode = rewritten->code;
