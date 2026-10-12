@@ -187,12 +187,12 @@ static int analyze(const uint32_t *code, size_t words, struct plan *p) {
     memset(p, 0, sizeof *p);
     if (words < 5) return 0;
     uint32_t bound = code[3];
-    uint8_t *kind = calloc(bound, 1), *isconst = calloc(bound, 1), *chain = calloc(bound, 1);
+    uint8_t *kind = calloc(bound, 1), *isconst = calloc(bound, 1), *chain = calloc(bound, 1), *isptr = calloc(bound, 1);
     struct func *f = calloc(words / 4 + 1, sizeof *f);
     struct call *c = calloc(words / 4 + 1, sizeof *c);
     uint32_t *entries = calloc(words / 4 + 1, sizeof *entries);
     int nf = 0, nc = 0, ne = 0, cur = -1, ok = 0;
-    if (!kind || !isconst || !chain || !f || !c || !entries) goto out;
+    if (!kind || !isconst || !chain || !isptr || !f || !c || !entries) goto out;
 
     for (size_t i = 5; i < words;) {
         uint32_t op = code[i] & 0xffff, len = code[i] >> 16;
@@ -206,10 +206,13 @@ static int analyze(const uint32_t *code, size_t words, struct plan *p) {
             cur = nf++;
         } else if (op == OP_FUNCTION_END) {
             cur = -1;
+        } else if (op == OP_TYPE_POINTER && len > 1 && w[1] < bound) {
+            isptr[w[1]] = 1;
         } else if (op == OP_TYPE_STRUCT && len > 1 && w[1] < bound) {
             kind[w[1]] |= K_STRUCT_TYPE;
         } else if (op == OP_FUNCTION_PARAMETER && len > 2 && w[2] < bound) {
             kind[w[2]] |= K_PARAM;
+            if (cur >= 0 && !(w[1] < bound && isptr[w[1]])) f[cur].needed = 1;
         } else if (op == OP_COMPOSITE_EXTRACT && len > 3 && w[2] < bound && w[3] < bound) {
             if (kind[w[3]] & (K_PARAM | K_FROM_PARAM)) kind[w[2]] |= K_FROM_PARAM;
             if (kind[w[3]] & K_CONSTRUCT) p->simplify_needed = 1;
@@ -274,6 +277,7 @@ out:
     free(kind);
     free(isconst);
     free(chain);
+    free(isptr);
     free(f);
     free(c);
     free(entries);
