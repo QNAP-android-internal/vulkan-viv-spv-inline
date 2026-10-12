@@ -8,7 +8,10 @@
 
 #define EXPORT __attribute__((visibility("default")))
 
+#define OP_EXT_INST_IMPORT 11
+#define OP_EXT_INST 12
 #define OP_ENTRY_POINT 15
+#define OP_TYPE_VECTOR 23
 #define OP_TYPE_IMAGE 25
 #define OP_TYPE_SAMPLED_IMAGE 27
 #define OP_TYPE_ARRAY 28
@@ -22,6 +25,10 @@
 #define OP_VARIABLE 59
 #define OP_COMPOSITE_CONSTRUCT 80
 #define OP_COMPOSITE_EXTRACT 81
+#define OP_F_ADD 129
+#define OP_F_SUB 131
+#define OP_VECTOR_TIMES_SCALAR 142
+#define GLSL_FMIX 46
 
 #define SC_UNIFORM_CONSTANT 0
 #define FC_INLINE 0x1
@@ -57,6 +64,7 @@ struct plan {
     int inline_needed;
     int simplify_needed;
     int strip_needed;
+    int mix_needed;
 };
 
 static int func_index(struct func *f, int n, uint32_t id) {
@@ -91,6 +99,85 @@ out:
     free(constant);
     free(pointee);
     return total;
+}
+
+
+static int has_type_and_id(uint32_t op) {
+    if (op >= 109 && op <= 148) return 1;
+    switch (op) {
+    case 1: case OP_EXT_INST: case 41: case 42: case OP_CONSTANT: case 44: case 45:
+    case OP_FUNCTION_PARAMETER: case OP_VARIABLE: case 61: case 65: case 66: case 79:
+    case OP_COMPOSITE_CONSTRUCT: case OP_COMPOSITE_EXTRACT: case 82: case 83: case 169: case 245:
+        return 1;
+    }
+    return 0;
+}
+
+static uint32_t *premix(const uint32_t *code, size_t *words_io, int *count) {
+    size_t words = *words_io;
+    *count = 0;
+    if (words < 5) return NULL;
+    uint32_t bound = code[3], glsl = 0, *out = NULL;
+    uint32_t *rtype = calloc(bound, sizeof *rtype), *vcomp = calloc(bound, sizeof *vcomp);
+    size_t *def_at = calloc(bound, sizeof *def_at), *at = calloc(words / 8 + 1, sizeof *at);
+    uint8_t *isvec = calloc(bound, 1);
+    int n = 0;
+    if (!rtype || !vcomp || !def_at || !at || !isvec) goto out;
+    for (size_t i = 5; i < words;) {
+        uint32_t op = code[i] & 0xffff, len = code[i] >> 16;
+        if (len == 0 || i + len > words) goto out;
+        const uint32_t *w = &code[i];
+        if (op == OP_EXT_INST_IMPORT && len > 5 && w[1] < bound && !memcmp(&w[2], "GLSL.std.450", 13)) glsl = w[1];
+        else if (op == OP_TYPE_VECTOR && len > 3 && w[1] < bound) { isvec[w[1]] = 1; vcomp[w[1]] = w[2]; }
+        else if (has_type_and_id(op) && len > 2 && w[2] < bound) { rtype[w[2]] = w[1]; def_at[w[2]] = i; }
+        i += len;
+    }
+    if (!glsl) goto out;
+    for (size_t i = 5; i < words;) {
+        uint32_t op = code[i] & 0xffff, len = code[i] >> 16;
+        const uint32_t *w = &code[i];
+        if (op == OP_EXT_INST && len == 8 && w[3] == glsl && w[4] == GLSL_FMIX && w[1] < bound && isvec[w[1]] &&
+            w[7] < bound && def_at[w[7]]) {
+            const uint32_t *c = &code[def_at[w[7]]];
+            uint32_t cop = c[0] & 0xffff, clen = c[0] >> 16;
+            if (cop == OP_COMPOSITE_CONSTRUCT && clen >= 4 && c[1] == w[1] && c[3] < bound && rtype[c[3]] == vcomp[w[1]]) {
+                int splat = 1;
+                for (uint32_t k = 4; k < clen; k++) if (c[k] != c[3]) splat = 0;
+                if (splat) at[n++] = i;
+            }
+        }
+        i += len;
+    }
+    if (!n) goto out;
+    out = malloc((words + 7 * n) * 4);
+    if (!out) goto out;
+    memcpy(out, code, 5 * 4);
+    out[3] = bound + 2 * n;
+    size_t o = 5;
+    int k = 0;
+    uint32_t next = bound;
+    for (size_t i = 5; i < words;) {
+        uint32_t len = code[i] >> 16;
+        const uint32_t *w = &code[i];
+        if (k < n && at[k] == i) {
+            uint32_t T = w[1], Y = w[2], a = w[5], b = w[6], s = code[def_at[w[7]] + 3], t1 = next++, t2 = next++;
+            uint32_t ins[15] = { (5u << 16) | OP_F_SUB, T, t1, b, a,
+                                 (5u << 16) | OP_VECTOR_TIMES_SCALAR, T, t2, t1, s,
+                                 (5u << 16) | OP_F_ADD, T, Y, a, t2 };
+            memcpy(&out[o], ins, sizeof ins);
+            o += 15;
+            k++;
+        } else {
+            memcpy(&out[o], w, len * 4);
+            o += len;
+        }
+        i += len;
+    }
+    *words_io = o;
+    *count = n;
+out:
+    free(rtype); free(vcomp); free(def_at); free(at); free(isvec);
+    return out;
 }
 
 static int analyze(const uint32_t *code, size_t words, struct plan *p) {
@@ -189,6 +276,7 @@ static spv_binary rewrite(const uint32_t *code, size_t words, const struct plan 
         flags[n++] = "--inline-entry-points-exhaustive";
         flags[n++] = "--eliminate-dead-functions";
     }
+    if (p->mix_needed && !p->inline_needed) flags[n++] = "--eliminate-dead-code-aggressive";
     if (p->simplify_needed) flags[n++] = "--simplify-instructions";
     if (p->strip_needed) {
         flags[n++] = "--remove-unused-interface-variables";
@@ -211,22 +299,29 @@ layer_CreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo *info,
                          const VkAllocationCallbacks *alloc, VkShaderModule *module) {
     PFN_vkCreateShaderModule next =
         (PFN_vkCreateShaderModule)next_gdpa(device, "vkCreateShaderModule");
-    size_t words = info->codeSize / 4;
+    size_t words = info->codeSize / 4, orig_words = words;
+    int nmix = 0;
+    uint32_t *pre = enabled("VIV_SPV_NO_MIX") ? premix(info->pCode, &words, &nmix) : NULL;
+    const uint32_t *cur = pre ? pre : info->pCode;
     struct plan p;
-    if (!analyze(info->pCode, words, &p) || !(p.inline_needed || p.simplify_needed || p.strip_needed)) {
+    int ok = analyze(cur, words, &p);
+    p.mix_needed = nmix > 0;
+    if (!ok || !(p.inline_needed || p.simplify_needed || p.strip_needed || p.mix_needed)) {
         free(p.code);
+        free(pre);
         return next(device, info, alloc, module);
     }
 
-    spv_binary rewritten = rewrite(info->pCode, words, &p);
+    spv_binary rewritten = rewrite(cur, words, &p);
     free(p.code);
+    free(pre);
     if (!rewritten) {
-        fprintf(stderr, "viv_spv_inline: rewrite failed, passing module through (%zu words)\n", words);
+        fprintf(stderr, "viv_spv_inline: rewrite failed, passing module through (%zu words)\n", orig_words);
         return next(device, info, alloc, module);
     }
     if (debug())
-        fprintf(stderr, "viv_spv_inline: rewrote module %zu -> %zu words (inline=%d simplify=%d strip=%d)\n",
-                words, rewritten->wordCount, p.inline_needed, p.simplify_needed, p.strip_needed);
+        fprintf(stderr, "viv_spv_inline: rewrote module %zu -> %zu words (inline=%d simplify=%d strip=%d mix=%d)\n",
+                orig_words, rewritten->wordCount, p.inline_needed, p.simplify_needed, p.strip_needed, nmix);
     VkShaderModuleCreateInfo patched = *info;
     patched.codeSize = rewritten->wordCount * 4;
     patched.pCode = rewritten->code;
