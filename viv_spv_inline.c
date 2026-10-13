@@ -23,6 +23,7 @@
 #define OP_FUNCTION_END 56
 #define OP_FUNCTION_CALL 57
 #define OP_VARIABLE 59
+#define OP_DECORATE 71
 #define OP_ACCESS_CHAIN 65
 #define OP_IN_BOUNDS_ACCESS_CHAIN 66
 #define OP_COMPOSITE_CONSTRUCT 80
@@ -33,6 +34,8 @@
 #define GLSL_FMIX 46
 
 #define SC_UNIFORM_CONSTANT 0
+#define DECORATION_BINDING 33
+#define DECORATION_DESCRIPTOR_SET 34
 #define FC_INLINE 0x1
 #define FC_DONT_INLINE 0x2
 
@@ -313,6 +316,86 @@ static spv_binary rewrite(const uint32_t *code, size_t words, const struct plan 
     return out;
 }
 
+struct binding_ref {
+    uint32_t set;
+    uint32_t binding;
+};
+
+struct module_info {
+    VkShaderModule module;
+    struct binding_ref *bindings;
+    uint32_t n;
+};
+
+struct set_info {
+    VkDescriptorSetLayout layout;
+    VkDescriptorSetLayoutCreateFlags flags;
+    VkDescriptorSetLayoutBinding *bindings;
+    VkSampler *samplers;
+    uint32_t n;
+};
+
+struct pipeline_layout_info {
+    VkPipelineLayout layout;
+    VkPipelineLayoutCreateFlags flags;
+    VkDescriptorSetLayout *sets;
+    uint32_t n_sets;
+    VkPushConstantRange *push;
+    uint32_t n_push;
+};
+
+static pthread_mutex_t layouts_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct module_info *modules;
+static size_t n_modules, cap_modules;
+static struct set_info *sets;
+static size_t n_sets, cap_sets;
+static struct pipeline_layout_info *pipeline_layouts;
+static size_t n_pipeline_layouts, cap_pipeline_layouts;
+
+#define PUSH(arr, n, cap, item) do { \
+    if (n == cap) { \
+        size_t new_cap = cap ? cap * 2 : 64; \
+        void *grown = realloc(arr, new_cap * sizeof *arr); \
+        if (grown) { arr = grown; cap = new_cap; } \
+    } \
+    if (n < cap) arr[n++] = item; \
+} while (0)
+
+static void push_set(struct set_info s) { PUSH(sets, n_sets, cap_sets, s); }
+static void push_pipeline_layout(struct pipeline_layout_info p) { PUSH(pipeline_layouts, n_pipeline_layouts, cap_pipeline_layouts, p); }
+
+static void record_module(VkShaderModule module, const uint32_t *code, size_t words) {
+    if (words < 5) return;
+    uint32_t bound = code[3];
+    uint32_t *set = malloc(bound * sizeof *set), *binding = malloc(bound * sizeof *binding);
+    if (!set || !binding) {
+        free(set);
+        free(binding);
+        return;
+    }
+    memset(set, 0xff, bound * sizeof *set);
+    memset(binding, 0xff, bound * sizeof *binding);
+    for (size_t i = 5; i < words;) {
+        const uint32_t *w = code + i;
+        uint16_t op = w[0] & 0xffff, len = w[0] >> 16;
+        if (len == 0 || i + len > words) break;
+        if (op == OP_DECORATE && len == 4 && w[1] < bound) {
+            if (w[2] == DECORATION_BINDING) binding[w[1]] = w[3];
+            else if (w[2] == DECORATION_DESCRIPTOR_SET) set[w[1]] = w[3];
+        }
+        i += len;
+    }
+    struct module_info m = { module, calloc(bound, sizeof *m.bindings), 0 };
+    for (uint32_t id = 0; id < bound && m.bindings; id++)
+        if (set[id] != 0xffffffff && binding[id] != 0xffffffff)
+            m.bindings[m.n++] = (struct binding_ref){ set[id], binding[id] };
+    free(set);
+    free(binding);
+    pthread_mutex_lock(&layouts_lock);
+    PUSH(modules, n_modules, cap_modules, m);
+    pthread_mutex_unlock(&layouts_lock);
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL
 layer_CreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo *info,
                          const VkAllocationCallbacks *alloc, VkShaderModule *module) {
@@ -328,7 +411,9 @@ layer_CreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo *info,
     if (!ok || !(p.inline_needed || p.simplify_needed || p.strip_needed || p.mix_needed || p.chain_needed)) {
         free(p.code);
         free(pre);
-        return next(device, info, alloc, module);
+        VkResult r = next(device, info, alloc, module);
+        if (r == VK_SUCCESS) record_module(*module, info->pCode, orig_words);
+        return r;
     }
 
     spv_binary rewritten = rewrite(cur, words, &p);
@@ -336,7 +421,9 @@ layer_CreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo *info,
     free(pre);
     if (!rewritten) {
         fprintf(stderr, "viv_spv_inline: rewrite failed, passing module through (%zu words)\n", orig_words);
-        return next(device, info, alloc, module);
+        VkResult r = next(device, info, alloc, module);
+        if (r == VK_SUCCESS) record_module(*module, info->pCode, orig_words);
+        return r;
     }
     if (debug())
         fprintf(stderr, "viv_spv_inline: rewrote module %zu -> %zu words (inline=%d simplify=%d strip=%d mix=%d chain=%d)\n",
@@ -345,7 +432,169 @@ layer_CreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo *info,
     patched.codeSize = rewritten->wordCount * 4;
     patched.pCode = rewritten->code;
     VkResult r = next(device, &patched, alloc, module);
+    if (r == VK_SUCCESS) record_module(*module, rewritten->code, rewritten->wordCount);
     spvBinaryDestroy(rewritten);
+    return r;
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+layer_DestroyShaderModule(VkDevice device, VkShaderModule module, const VkAllocationCallbacks *alloc) {
+    pthread_mutex_lock(&layouts_lock);
+    for (size_t i = 0; i < n_modules; i++)
+        if (modules[i].module == module) {
+            free(modules[i].bindings);
+            modules[i] = modules[--n_modules];
+            break;
+        }
+    pthread_mutex_unlock(&layouts_lock);
+    ((PFN_vkDestroyShaderModule)next_gdpa(device, "vkDestroyShaderModule"))(device, module, alloc);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+layer_CreateDescriptorSetLayout(VkDevice device, const VkDescriptorSetLayoutCreateInfo *info,
+                                const VkAllocationCallbacks *alloc, VkDescriptorSetLayout *layout) {
+    VkResult r = ((PFN_vkCreateDescriptorSetLayout)next_gdpa(device, "vkCreateDescriptorSetLayout"))(device, info, alloc, layout);
+    if (r != VK_SUCCESS) return r;
+    struct set_info s = { *layout, info->flags, NULL, NULL, info->bindingCount };
+    s.bindings = calloc(s.n ? s.n : 1, sizeof *s.bindings);
+    size_t n_samplers = 0;
+    for (uint32_t i = 0; i < s.n; i++)
+        if (info->pBindings[i].pImmutableSamplers) n_samplers += info->pBindings[i].descriptorCount;
+    s.samplers = calloc(n_samplers ? n_samplers : 1, sizeof *s.samplers);
+    n_samplers = 0;
+    for (uint32_t i = 0; i < s.n; i++) {
+        s.bindings[i] = info->pBindings[i];
+        if (s.bindings[i].pImmutableSamplers) {
+            memcpy(s.samplers + n_samplers, s.bindings[i].pImmutableSamplers, s.bindings[i].descriptorCount * sizeof *s.samplers);
+            s.bindings[i].pImmutableSamplers = s.samplers + n_samplers;
+            n_samplers += s.bindings[i].descriptorCount;
+        }
+    }
+    pthread_mutex_lock(&layouts_lock);
+    push_set(s);
+    pthread_mutex_unlock(&layouts_lock);
+    return r;
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+layer_DestroyDescriptorSetLayout(VkDevice device, VkDescriptorSetLayout layout, const VkAllocationCallbacks *alloc) {
+    pthread_mutex_lock(&layouts_lock);
+    for (size_t i = 0; i < n_sets; i++)
+        if (sets[i].layout == layout) {
+            free(sets[i].bindings);
+            free(sets[i].samplers);
+            sets[i] = sets[--n_sets];
+            break;
+        }
+    pthread_mutex_unlock(&layouts_lock);
+    ((PFN_vkDestroyDescriptorSetLayout)next_gdpa(device, "vkDestroyDescriptorSetLayout"))(device, layout, alloc);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+layer_CreatePipelineLayout(VkDevice device, const VkPipelineLayoutCreateInfo *info,
+                           const VkAllocationCallbacks *alloc, VkPipelineLayout *layout) {
+    VkResult r = ((PFN_vkCreatePipelineLayout)next_gdpa(device, "vkCreatePipelineLayout"))(device, info, alloc, layout);
+    if (r != VK_SUCCESS) return r;
+    struct pipeline_layout_info p = { *layout, info->flags, NULL, info->setLayoutCount, NULL, info->pushConstantRangeCount };
+    p.sets = calloc(p.n_sets ? p.n_sets : 1, sizeof *p.sets);
+    p.push = calloc(p.n_push ? p.n_push : 1, sizeof *p.push);
+    memcpy(p.sets, info->pSetLayouts, p.n_sets * sizeof *p.sets);
+    memcpy(p.push, info->pPushConstantRanges, p.n_push * sizeof *p.push);
+    pthread_mutex_lock(&layouts_lock);
+    push_pipeline_layout(p);
+    pthread_mutex_unlock(&layouts_lock);
+    return r;
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+layer_DestroyPipelineLayout(VkDevice device, VkPipelineLayout layout, const VkAllocationCallbacks *alloc) {
+    pthread_mutex_lock(&layouts_lock);
+    for (size_t i = 0; i < n_pipeline_layouts; i++)
+        if (pipeline_layouts[i].layout == layout) {
+            free(pipeline_layouts[i].sets);
+            free(pipeline_layouts[i].push);
+            pipeline_layouts[i] = pipeline_layouts[--n_pipeline_layouts];
+            break;
+        }
+    pthread_mutex_unlock(&layouts_lock);
+    ((PFN_vkDestroyPipelineLayout)next_gdpa(device, "vkDestroyPipelineLayout"))(device, layout, alloc);
+}
+
+static int module_uses(const struct module_info *m, uint32_t set, uint32_t binding) {
+    for (uint32_t i = 0; i < m->n; i++)
+        if (m->bindings[i].set == set && m->bindings[i].binding == binding) return 1;
+    return 0;
+}
+
+static VkPipelineLayout trimmed_layout(VkDevice device, const VkGraphicsPipelineCreateInfo *info) {
+    const struct module_info *stage[8];
+    uint32_t n_stage = 0;
+    VkPipelineLayout result = VK_NULL_HANDLE;
+    pthread_mutex_lock(&layouts_lock);
+    for (uint32_t i = 0; i < info->stageCount && n_stage < 8; i++)
+        for (size_t j = 0; j < n_modules; j++)
+            if (modules[j].module == info->pStages[i].module) stage[n_stage++] = &modules[j];
+    const struct pipeline_layout_info *pl = NULL;
+    for (size_t i = 0; i < n_pipeline_layouts; i++)
+        if (pipeline_layouts[i].layout == info->layout) pl = &pipeline_layouts[i];
+    if (!pl || n_stage != info->stageCount) goto out;
+
+    VkDescriptorSetLayout new_sets[16];
+    int changed = 0;
+    for (uint32_t s = 0; s < pl->n_sets && s < 16; s++) {
+        const struct set_info *set = NULL;
+        for (size_t i = 0; i < n_sets; i++)
+            if (sets[i].layout == pl->sets[s]) set = &sets[i];
+        new_sets[s] = pl->sets[s];
+        if (!set) continue;
+        VkDescriptorSetLayoutBinding *b = malloc((set->n ? set->n : 1) * sizeof *b);
+        int unused = 0;
+        for (uint32_t i = 0; i < set->n; i++) {
+            b[i] = set->bindings[i];
+            int used = 0;
+            for (uint32_t k = 0; k < n_stage; k++) used |= module_uses(stage[k], s, b[i].binding);
+            if (!used && (b[i].stageFlags & VK_SHADER_STAGE_ALL_GRAPHICS)) {
+                b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+                unused++;
+            }
+        }
+        if (unused) {
+            VkDescriptorSetLayoutCreateInfo ci = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, set->flags, set->n, b };
+            if (((PFN_vkCreateDescriptorSetLayout)next_gdpa(device, "vkCreateDescriptorSetLayout"))(device, &ci, NULL, &new_sets[s]) == VK_SUCCESS)
+                changed++;
+            else
+                new_sets[s] = pl->sets[s];
+        }
+        free(b);
+    }
+    if (changed) {
+        VkPipelineLayoutCreateInfo ci = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, pl->flags,
+                                          pl->n_sets, new_sets, pl->n_push, pl->push };
+        if (((PFN_vkCreatePipelineLayout)next_gdpa(device, "vkCreatePipelineLayout"))(device, &ci, NULL, &result) != VK_SUCCESS)
+            result = VK_NULL_HANDLE;
+    }
+out:
+    pthread_mutex_unlock(&layouts_lock);
+    return result;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+layer_CreateGraphicsPipelines(VkDevice device, VkPipelineCache cache, uint32_t count,
+                              const VkGraphicsPipelineCreateInfo *infos, const VkAllocationCallbacks *alloc,
+                              VkPipeline *pipelines) {
+    PFN_vkCreateGraphicsPipelines next = (PFN_vkCreateGraphicsPipelines)next_gdpa(device, "vkCreateGraphicsPipelines");
+    VkResult r = next(device, cache, count, infos, alloc, pipelines);
+    if (r != VK_ERROR_INVALID_SHADER_NV || !enabled("VIV_NO_LAYOUT_TRIM")) return r;
+    r = VK_SUCCESS;
+    for (uint32_t i = 0; i < count; i++) {
+        if (pipelines[i] != VK_NULL_HANDLE) continue;
+        VkGraphicsPipelineCreateInfo patched = infos[i];
+        patched.layout = trimmed_layout(device, &infos[i]);
+        VkResult one = patched.layout ? next(device, cache, 1, &patched, alloc, &pipelines[i]) : VK_ERROR_INVALID_SHADER_NV;
+        if (debug())
+            fprintf(stderr, "viv_spv_inline: pipeline retry with trimmed layout -> %d\n", one);
+        if (one != VK_SUCCESS) r = one;
+    }
     return r;
 }
 
@@ -478,6 +727,12 @@ layer_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInfo *info,
 
 static PFN_vkVoidFunction device_hook(const char *name) {
     if (!strcmp(name, "vkCreateShaderModule")) return (PFN_vkVoidFunction)layer_CreateShaderModule;
+    if (!strcmp(name, "vkDestroyShaderModule")) return (PFN_vkVoidFunction)layer_DestroyShaderModule;
+    if (!strcmp(name, "vkCreateDescriptorSetLayout")) return (PFN_vkVoidFunction)layer_CreateDescriptorSetLayout;
+    if (!strcmp(name, "vkDestroyDescriptorSetLayout")) return (PFN_vkVoidFunction)layer_DestroyDescriptorSetLayout;
+    if (!strcmp(name, "vkCreatePipelineLayout")) return (PFN_vkVoidFunction)layer_CreatePipelineLayout;
+    if (!strcmp(name, "vkDestroyPipelineLayout")) return (PFN_vkVoidFunction)layer_DestroyPipelineLayout;
+    if (!strcmp(name, "vkCreateGraphicsPipelines")) return (PFN_vkVoidFunction)layer_CreateGraphicsPipelines;
     if (!strcmp(name, "vkCreateImage")) return (PFN_vkVoidFunction)layer_CreateImage;
     if (!strcmp(name, "vkDestroyImage")) return (PFN_vkVoidFunction)layer_DestroyImage;
     if (!strcmp(name, "vkCreateImageView")) return (PFN_vkVoidFunction)layer_CreateImageView;
